@@ -239,14 +239,16 @@ jobs:
             cp -R dxb/fakeroot/System/Library/Kernels/. out/
           fi
 
-          kernels=(out/kernel.*)
+          files=()
+          for f in out/kernel.*; do
+            [[ -f "$f" ]] && files+=("${f#out/}")
+          done
 
-          if [ "${#kernels[@]}" -gt 0 ]; then
-            (cd out && shasum -a 256 kernel.* > SHA256SUMS)
+          if ((${#files[@]} > 0)); then
+            (cd out && shasum -a 256 "${files[@]}" > SHA256SUMS)
           else
-            echo "No kernel binaries were produced"
+            echo "No kernel files were produced"
           fi
-
           echo "=== Output files ==="
           find out -maxdepth 3 -type f -print
 
