@@ -1,3 +1,4 @@
+```yaml
 name: xnu
 
 on:
@@ -6,17 +7,26 @@ on:
       macos_version:
         description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
         default: "13.5"
+        type: string
       kernel_config:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
+        type: choice
+        options:
+          - RELEASE
+          - DEVELOPMENT
+          - DEBUG
       machine_config:
         description: xnu MACHINE_CONFIG
         default: SWEET
+        type: string
       keep_going:
         description: make -k (collect all compile errors in one run)
-        default: "true"
+        default: true
+        type: boolean
+
   push:
-    branches: [main]
+    branches: [miatoll]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -34,82 +44,219 @@ env:
 
 jobs:
   build:
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
     runs-on: macos-15-intel
     timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Fetch build script
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch build script and apply patches
+        shell: bash
         run: |
+          set -euo pipefail
+
           git init -q dxb
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
+
+          # Copy project patches into the build script repository.
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
-          ls dxb/patches
-      - name: Deps
+
+          # SWEET uses arm64; include it in libfirehose_kernel architectures.
+          sed -i '' \
+            's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' \
+            dxb/build.sh
+
+          # Show xcodes references before modifying anything.
+          echo "=== xcodes references in build.sh ==="
+          grep -n -C 3 'xcodes' dxb/build.sh || true
+
+          # The runner already has Xcode. Remove xcodes from simple Homebrew
+          # package lists, if the pinned script contains such a list.
+          sed -i '' \
+            -E 's/(brew install[^#]* )xcodes /\1/g; s/(brew install[^#]* )xcodes$/\1/g' \
+            dxb/build.sh
+
+          echo "=== Remaining xcodes references ==="
+          grep -n -C 2 'xcodes' dxb/build.sh || true
+
+          echo "=== Patch files ==="
+          ls -la dxb/patches
+
+          echo "=== Architecture check ==="
+          grep -n 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+
+      - name: Prepare Xcode and dependencies
+        shell: bash
         run: |
+          set -euo pipefail
+
+          echo "=== macOS ==="
           sw_vers
-          ls -la /Applications/
-          ls -d /Applications/Xcode*.app || true
-          xcodebuild -version || true
-      - name: Build
+
+          echo "=== Available Xcode installations ==="
+          ls -ld /Applications/Xcode*.app || true
+
+          # Prefer Xcode 15 if installed, otherwise use the available Xcode.
+          XC="$(find /Applications -maxdepth 1 -type d -name 'Xcode_15*.app' | sort -V | head -n 1)"
+
+          if [ -z "$XC" ]; then
+            XC="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | sort -V | head -n 1)"
+          fi
+
+          if [ -z "$XC" ]; then
+            echo "::error::No Xcode installation found"
+            exit 1
+          fi
+
+          echo "Selected Xcode: $XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+
+          sudo xcode-select -s "$XC"
+          sudo xcodebuild -license accept
+
+          echo "=== Xcode version ==="
+          xcodebuild -version
+
+          echo "=== iig ==="
+          xcrun --find iig
+
+          echo "=== Install build dependencies ==="
+          brew install jq gum bash cmake ninja
+
+          echo "=== Dependency versions ==="
+          jq --version
+          cmake --version
+          ninja --version
+          bash --version
+
+      - name: Build XNU
+        shell: bash
         working-directory: dxb
         env:
-          # keep going after errors so one run reports every compile failure
-          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+          MAKEFLAGS: ${{ inputs.keep_going == false && '' || '-k' }}
+        run: |
+          set -o pipefail
+          bash build.sh
 
       - name: Package build tree for local compiles
         if: always()
+        shell: bash
         run: |
-          # Generated headers, config option headers, mig output and the patched
-          # source: enough to re-run any single compile command from the log locally.
-          SDK=$(xcrun --sdk macosx --show-sdk-path)
-          mkdir -p sdk-kernel-platform
-          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
-          tar czf buildtree.tgz \
-            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
-            --exclude='kernel.development.*' --exclude='.git' \
-            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
-            -C .. sdk-kernel-platform
-          ls -la buildtree.tgz
+          set -u
 
-      - uses: actions/upload-artifact@v4
+          mkdir -p package sdk-kernel-platform
+
+          if xcrun --sdk macosx --show-sdk-path >/dev/null 2>&1; then
+            SDK="$(xcrun --sdk macosx --show-sdk-path)"
+            PLATFORM="$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform"
+
+            if [ -d "$PLATFORM" ]; then
+              cp -R "$PLATFORM" sdk-kernel-platform/
+            else
+              echo "Kernel platform headers not found in SDK"
+            fi
+          fi
+
+          TAR_ARGS=()
+
+          for path in \
+            build/xnu.obj \
+            fakeroot/usr/local/include \
+            xnu
+          do
+            if [ -e "dxb/$path" ]; then
+              TAR_ARGS+=("$path")
+            else
+              echo "Skipping missing path: dxb/$path"
+            fi
+          done
+
+          if [ -d sdk-kernel-platform ]; then
+            TAR_ARGS+=("../sdk-kernel-platform")
+          fi
+
+          if [ "${#TAR_ARGS[@]}" -gt 0 ]; then
+            tar czf package/buildtree.tgz \
+              --exclude='*.o' \
+              --exclude='*.cpo' \
+              --exclude='*.a' \
+              --exclude='*.dSYM' \
+              --exclude='*.unstripped' \
+              --exclude='kernel.development.*' \
+              --exclude='.git' \
+              -C dxb "${TAR_ARGS[@]}"
+          else
+            echo "No build files available to package"
+          fi
+
+          ls -lah package || true
+
+      - name: Upload build tree
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: xnu-buildtree
-          path: buildtree.tgz
+          path: package/buildtree.tgz
+          if-no-files-found: warn
           retention-days: 7
 
-      - name: Inspect closed KDK support libs
+      - name: Inspect closed KDK support libraries
         if: always()
+        shell: bash
         run: |
+          set -u
+          shopt -s nullglob
+
           mkdir -p out/kdk-libs
-          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
-            b=$(basename "$lib" .a)
+
+          libs=(/Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a)
+
+          if [ "${#libs[@]}" -eq 0 ]; then
+            echo "No KDK support libraries found"
+          fi
+
+          for lib in "${libs[@]}"; do
+            b="$(basename "$lib" .a)"
+
             ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
             nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
             lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
           done
-          ls -la out/kdk-libs
 
-      - name: Collect
+          ls -lah out/kdk-libs
+
+      - name: Collect kernel
         if: always()
+        shell: bash
         run: |
-          mkdir -p out
-          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
-          ls -la out
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+          set -u
+          shopt -s nullglob
 
-      - uses: actions/upload-artifact@v4
+          mkdir -p out
+
+          if [ -d dxb/fakeroot/System/Library/Kernels ]; then
+            cp -R dxb/fakeroot/System/Library/Kernels/. out/
+          fi
+
+          kernels=(out/kernel.*)
+
+          if [ "${#kernels[@]}" -gt 0 ]; then
+            (cd out && shasum -a 256 kernel.* > SHA256SUMS)
+          else
+            echo "No kernel binaries were produced"
+          fi
+
+          echo "=== Output files ==="
+          find out -maxdepth 3 -type f -print
+
+      - name: Upload kernel and diagnostics
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+          retention-days: 7
+```
